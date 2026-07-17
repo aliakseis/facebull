@@ -212,7 +212,662 @@ Extensibility & Notes
 *   To support more compounds, increase machinesByInIdx buckets or adjust HASH\_BITS.
     
 
-License
--------
+# Algorithm Overview
 
-Distributed under the MIT License.
+## Purpose
+
+This project solves a **minimum-cost synthesis / transformation planning problem**.
+
+Given a collection of machines
+
+```
+Machine:
+    Input Compound
+    Output Compound
+    Cost
+```
+
+the program finds the **lowest-cost subset of machines** capable of transforming an initial compound into every required compound while satisfying dependency constraints.
+
+Unlike a shortest-path problem, this is a **state-space optimization** problem because every decision changes the set of currently available compounds and affects future possibilities.
+
+The implementation is essentially an optimized **A\*-like graph search** with aggressive pruning and several domain-specific heuristics.
+
+---
+
+# Problem Representation
+
+Every machine represents a directed transformation
+
+```
+Compound A
+      |
+      | Machine
+      V
+Compound B
+```
+
+Each machine has
+
+- machine identifier
+- source compound
+- destination compound
+- execution price
+
+Multiple machines may connect identical compounds.
+
+Only the cheapest equivalent transformation is retained.
+
+---
+
+# Compound Encoding
+
+Every compound is converted into an integer index.
+
+```cpp
+map<string,int> compoundsMapping;
+```
+
+Each compound becomes one bit inside a 32-bit mask.
+
+Example
+
+```
+Compound A -> bit 0
+Compound B -> bit 1
+Compound C -> bit 2
+...
+```
+
+This allows operations such as
+
+```
+contains compound?
+```
+
+to become
+
+```cpp
+mask & flag
+```
+
+instead of expensive map lookups.
+
+---
+
+# State Representation
+
+A search state is represented by
+
+```cpp
+struct VertexKey
+{
+    unsigned int body;
+    unsigned int tails;
+};
+```
+
+These two bitmasks completely describe the current synthesis state.
+
+---
+
+## body
+
+Represents compounds already placed inside the current synthesis body.
+
+Example
+
+```
+body
+
+A
+B
+C
+```
+
+encoded as
+
+```
+111000...
+```
+
+---
+
+## tails
+
+Represents compounds still exposed as unfinished outputs.
+
+Think of them as open branches of the synthesis tree.
+
+Example
+
+```
+body
+
+A
+|
++-- B
+|
++-- C
+```
+
+B and C remain in tails.
+
+---
+
+## Why two masks?
+
+A single bitmask is insufficient.
+
+The algorithm must distinguish between
+
+- compounds permanently integrated
+- compounds that are temporary frontier nodes
+
+which directly affects legal machine applications.
+
+---
+
+# Search Graph
+
+Every unique `(body, tails)` pair is one graph vertex.
+
+Applying one machine creates another vertex.
+
+```
+State 1
+
+(body,tails)
+
+        |
+        | machine
+        V
+
+State 2
+```
+
+The search graph is generated lazily.
+
+Only reachable states are created.
+
+---
+
+# Hash Table
+
+Vertices are stored in
+
+```cpp
+hashTable[HASH_SIZE]
+```
+
+using
+
+```cpp
+VertexKey::hash()
+```
+
+which applies
+
+```
+Knuth multiplicative hashing
+
+2654435769
+```
+
+This gives
+
+- constant lookup
+- no STL overhead
+- cache-friendly access
+
+Collision chains are handled by linked lists.
+
+---
+
+# Custom Memory Allocator
+
+Millions of vertices may be generated.
+
+Instead of
+
+```
+new
+delete
+```
+
+for every node,
+
+the project uses
+
+```
+FixedAlloc
+```
+
+which allocates memory in blocks.
+
+```
+Block
+
++---------------------+
+|Vertex|
+|Vertex|
+|Vertex|
+|Vertex|
++---------------------+
+```
+
+Advantages
+
+- almost zero allocation overhead
+- no heap fragmentation
+- cache locality
+- deterministic performance
+
+Very similar to MFC's
+
+```
+CFixedAlloc
+```
+
+implemented over
+
+```
+CPlex
+```
+
+style memory blocks.
+
+---
+
+# Priority Queue Search
+
+The algorithm maintains
+
+```cpp
+priority_queue<Priority>
+```
+
+Each entry contains
+
+```
+vertex
+parent
+estimated total cost
+finished flag
+```
+
+Vertices are always expanded in order of the smallest estimated total cost.
+
+This makes the algorithm equivalent to
+
+```
+Best-First Search
+```
+
+with A*-style evaluation.
+
+---
+
+# Cost Function
+
+Each vertex stores
+
+```cpp
+data[0]
+data[1]
+```
+
+representing two independent optimistic cost estimates.
+
+The effective estimate is
+
+```cpp
+max(data0,data1)
+```
+
+Using the maximum guarantees admissibility for both optimization criteria.
+
+---
+
+# Lower Bound Heuristics
+
+Two heuristic arrays are precomputed.
+
+```cpp
+estimates[]
+```
+
+Minimum incoming cost.
+
+```
+minimum cost producing compound X
+```
+
+---
+
+```cpp
+estimates2[]
+```
+
+Minimum outgoing cost.
+
+```
+minimum cost consuming compound X
+```
+
+These provide optimistic lower bounds.
+
+Whenever a machine is applied,
+
+the corresponding heuristic is subtracted
+
+```cpp
+data0 -= estimates[]
+data1 -= estimates2[]
+```
+
+This keeps estimates tight.
+
+---
+
+# State Expansion
+
+Expansion occurs in
+
+```
+handleVertex()
+```
+
+For every currently available compound
+
+```
+for every applicable machine
+```
+
+the algorithm
+
+1. validates legality
+2. constructs new state
+3. computes new estimate
+4. inserts state into priority queue
+
+---
+
+# Machine Legality
+
+The most complicated routine is
+
+```
+getNextKey()
+```
+
+Its job is determining whether one machine may legally execute.
+
+It verifies
+
+- body constraints
+- tail constraints
+- dependency ordering
+- recursive ancestry consistency
+
+Only legal transformations generate successors.
+
+---
+
+# Recursive Dependency Checking
+
+```
+checkVertex()
+```
+
+performs recursive verification that
+
+a partial synthesis can eventually reconnect to the main body.
+
+Without this check,
+
+the search would explore many impossible states.
+
+This is one of the strongest pruning heuristics.
+
+---
+
+# Dominance Pruning
+
+When a state already exists
+
+```
+same body
+same tails
+```
+
+only the cheaper one survives.
+
+```
+existing estimate <= new estimate
+
+↓
+
+discard
+```
+
+This prevents exponential duplication.
+
+---
+
+# Substitute Pruning
+
+```
+findSubstitute()
+```
+
+implements an additional dominance rule.
+
+If a more general state already achieves
+
+an equal or better estimate,
+
+the specialized state is ignored.
+
+This substantially reduces search size.
+
+---
+
+# Recursive Bound Tightening
+
+Whenever enough compounds have become fixed,
+
+```
+evaluateVertex()
+```
+
+recursively explores future possibilities
+
+without inserting nodes into the global queue.
+
+Purpose
+
+```
+improve upper bound
+```
+
+The resulting
+
+```
+minFinishing
+```
+
+becomes smaller,
+
+allowing later branches to be pruned immediately.
+
+---
+
+# Upper Bound
+
+Global variable
+
+```cpp
+minFinishing
+```
+
+stores
+
+```
+best complete solution found so far
+```
+
+Every new estimate satisfies
+
+```
+estimate >= minFinishing
+
+↓
+
+discard
+```
+
+Classic Branch-and-Bound pruning.
+
+---
+
+# Goal Detection
+
+A finished solution is
+
+```
+body == 1
+tails == 1
+```
+
+meaning
+
+- all compounds resolved
+- no unfinished branches remain
+
+When reached,
+
+the search terminates.
+
+---
+
+# Path Reconstruction
+
+Each vertex stores
+
+```
+parent
+```
+
+After completion,
+
+```
+reportSolution()
+```
+
+walks backwards
+
+```
+Goal
+
+↓
+
+Parent
+
+↓
+
+Parent
+
+↓
+
+Start
+```
+
+recovering every machine used.
+
+The final machine identifiers are sorted before printing.
+
+---
+
+# Complexity
+
+Worst case
+
+```
+Exponential
+```
+
+because the problem is fundamentally a combinatorial state-space search.
+
+Practical complexity is dramatically reduced through
+
+- admissible heuristics
+- A*-style ordering
+- dominance pruning
+- substitute pruning
+- recursive feasibility checking
+- branch-and-bound
+- duplicate elimination
+- custom memory allocator
+
+allowing surprisingly large problem instances to be solved efficiently.
+
+---
+
+# Algorithm Summary
+
+The overall algorithm is
+
+```
+Read input
+        │
+        ▼
+Compress compounds into bitmasks
+        │
+        ▼
+Remove dominated machines
+        │
+        ▼
+Compute heuristic lower bounds
+        │
+        ▼
+Create initial search state
+        │
+        ▼
+Priority Queue (Best-First / A*)
+        │
+        ▼
+Expand legal machines
+        │
+        ▼
+Generate successor states
+        │
+        ▼
+Prune duplicates
+        │
+        ▼
+Prune impossible states
+        │
+        ▼
+Prune using upper bound
+        │
+        ▼
+Reach complete synthesis
+        │
+        ▼
+Reconstruct optimal machine sequence
+```
+
+---
+
+# Technical Characteristics
+
+- **Search paradigm:** Heuristic Best-First Search (A\*-like)
+- **Optimization:** Branch-and-Bound
+- **State encoding:** Dual bitmask (`body`, `tails`)
+- **Graph construction:** Lazy (on-demand)
+- **Duplicate detection:** Custom hash table
+- **Memory management:** Block allocator (`FixedAlloc`)
+- **Heuristics:** Dual admissible lower-bound estimates
+- **Pruning:** Dominance, substitute-state elimination, recursive feasibility, upper-bound pruning
+- **Complexity:** Exponential worst case, heavily reduced in practice by layered heuristics
